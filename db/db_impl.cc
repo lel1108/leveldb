@@ -145,6 +145,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       seed_(0),
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
+      file_deletions_held_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
@@ -225,6 +226,12 @@ void DBImpl::MaybeIgnoreError(Status* s) const {
 void DBImpl::RemoveObsoleteFiles() {
   mutex_.AssertHeld();
 
+  if (file_deletions_held_) {
+    // A checkpoint is copying files. Keep everything on disk for now;
+    // ReleaseFileDeletions() runs this function again when it finishes.
+    return;
+  }
+
   if (!bg_error_.ok()) {
     // After a background error, we don't know whether a new version may
     // or may not have been committed, so we cannot safely garbage collect.
@@ -287,6 +294,29 @@ void DBImpl::RemoveObsoleteFiles() {
     env_->RemoveFile(dbname_ + "/" + filename);
   }
   mutex_.Lock();
+}
+
+void DBImpl::HoldFileDeletions() {
+  mutex_.AssertHeld();
+  assert(!file_deletions_held_);  // one checkpoint at a time
+  file_deletions_held_ = true;
+}
+
+void DBImpl::ReleaseFileDeletions() {
+  mutex_.AssertHeld();
+  file_deletions_held_ = false;
+  // Delete whatever became obsolete while the hold was active.
+  RemoveObsoleteFiles();
+}
+
+void DBImpl::TEST_HoldFileDeletions() {
+  MutexLock l(&mutex_);
+  HoldFileDeletions();
+}
+
+void DBImpl::TEST_ReleaseFileDeletions() {
+  MutexLock l(&mutex_);
+  ReleaseFileDeletions();
 }
 
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {

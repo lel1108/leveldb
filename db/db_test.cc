@@ -471,6 +471,18 @@ class DBTest : public testing::Test {
     return static_cast<int>(files.size());
   }
 
+  // Number of .ldb (SSTable) files physically present in the DB directory,
+  // including obsolete ones that have not been deleted yet.
+  int CountTableFilesOnDisk() {
+    std::vector<std::string> files;
+    env_->GetChildren(dbname_, &files);
+    int n = 0;
+    for (const std::string& f : files) {
+      if (f.size() > 4 && f.compare(f.size() - 4, 4, ".ldb") == 0) n++;
+    }
+    return n;
+  }
+
   uint64_t Size(const Slice& start, const Slice& limit) {
     Range r(start, limit);
     uint64_t size;
@@ -1634,6 +1646,32 @@ TEST_F(DBTest, CustomComparator) {
     }
     Compact("[0]", "[1000000]");
   }
+}
+
+// Checkpoint: while file deletions are held, files made obsolete by a
+// compaction must stay on disk; releasing the hold deletes them.
+TEST_F(DBTest, HoldFileDeletionsKeepsObsoleteFiles) {
+  ASSERT_LEVELDB_OK(Put("a", "v1"));
+  ASSERT_LEVELDB_OK(Put("z", "v1"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  ASSERT_LEVELDB_OK(Put("a", "v2"));
+  ASSERT_LEVELDB_OK(Put("z", "v2"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  ASSERT_EQ(2, TotalTableFiles());
+  ASSERT_EQ(2, CountTableFilesOnDisk());
+
+  dbfull()->TEST_HoldFileDeletions();
+
+  db_->CompactRange(nullptr, nullptr);
+  ASSERT_EQ(1, TotalTableFiles());
+  ASSERT_EQ(3, CountTableFilesOnDisk());  // old files still on disk
+  ASSERT_EQ("v2", Get("a"));
+
+  dbfull()->TEST_ReleaseFileDeletions();
+
+  ASSERT_EQ(1, CountTableFilesOnDisk());  // only the live file remains
+  ASSERT_EQ("v2", Get("a"));
+  ASSERT_EQ("v2", Get("z"));
 }
 
 TEST_F(DBTest, ManualCompaction) {
