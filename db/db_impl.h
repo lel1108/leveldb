@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 
+#include "db/checkpoint.h"
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
@@ -66,7 +67,16 @@ class DBImpl : public DB {
   // file at a level >= 1.
   int64_t TEST_MaxNextLevelOverlappingBytes();
 
-  // Checkpoint support: while a hold is active, obsolete files are kept on
+  // Checkpoint, DB-layer part.
+  // PrepareCheckpoint() fills *plan with every file the checkpoint needs and
+  // how many bytes of each append-only file to copy, all taken at one
+  // instant, then holds file deletions so those files stay on disk.
+  // FinishCheckpoint() must be called afterwards, whether copying the files
+  // succeeded or not: it releases the hold.
+  Status PrepareCheckpoint(CheckpointPlan* plan);
+  void FinishCheckpoint();
+  
+// Checkpoint support: while a hold is active, obsolete files are kept on
   // disk instead of being deleted, so a checkpoint can still link them.
   void TEST_HoldFileDeletions();
   void TEST_ReleaseFileDeletions();

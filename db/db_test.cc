@@ -1674,6 +1674,79 @@ TEST_F(DBTest, HoldFileDeletionsKeepsObsoleteFiles) {
   ASSERT_EQ("v2", Get("z"));
 }
 
+// Checkpoint: a copy made from the plan, even while the original keeps
+// changing, opens as a database showing the data at PrepareCheckpoint().
+// A plain copy stands in for the file layer here.
+TEST_F(DBTest, PrepareCheckpointPlanOpensAsCopy) {
+  ASSERT_LEVELDB_OK(Put("a", "1"));
+  ASSERT_LEVELDB_OK(Put("b", "1"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());  // now in a table
+  ASSERT_LEVELDB_OK(Put("b", "2"));                     // only in the log
+  ASSERT_LEVELDB_OK(Put("c", "2"));
+
+  CheckpointPlan plan;
+  ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
+  ASSERT_FALSE(plan.link_files.empty());
+  ASSERT_FALSE(plan.live_log_file.empty());
+  ASSERT_FALSE(plan.manifest_file.empty());
+
+  // Only one checkpoint at a time.
+  CheckpointPlan second;
+  ASSERT_TRUE(dbfull()->PrepareCheckpoint(&second).IsNotSupportedError());
+
+  // Change the original after the checkpoint instant, including a flush and
+  // a full compaction that make the planned files obsolete.
+  ASSERT_LEVELDB_OK(Put("a", "3"));
+  ASSERT_LEVELDB_OK(Delete("c"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  db_->CompactRange(nullptr, nullptr);
+
+  // Copy what the plan lists. Files are still there: deletions are held.
+  const std::string ckpt = dbname_ + "_ckpt";
+  DestroyDB(ckpt, Options());
+  ASSERT_LEVELDB_OK(env_->CreateDir(ckpt));
+  std::string data;
+  for (const std::string& name : plan.link_files) {
+    ASSERT_LEVELDB_OK(ReadFileToString(env_, dbname_ + "/" + name, &data));
+    ASSERT_LEVELDB_OK(WriteStringToFile(env_, data, ckpt + "/" + name));
+  }
+  ASSERT_LEVELDB_OK(
+      ReadFileToString(env_, dbname_ + "/" + plan.live_log_file, &data));
+  ASSERT_GE(data.size(), plan.live_log_size);
+  data.resize(plan.live_log_size);
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env_, data, ckpt + "/" + plan.live_log_file));
+  ASSERT_LEVELDB_OK(
+      ReadFileToString(env_, dbname_ + "/" + plan.manifest_file, &data));
+  ASSERT_GE(data.size(), plan.manifest_size);
+  data.resize(plan.manifest_size);
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env_, data, ckpt + "/" + plan.manifest_file));
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env_, plan.manifest_file + "\n", ckpt + "/CURRENT"));
+
+  dbfull()->FinishCheckpoint();
+
+  // The copy shows the data as it was at PrepareCheckpoint().
+  Options options;
+  options.env = env_;
+  DB* copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(options, ckpt, &copy));
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("1", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("2", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "c", &value));
+  ASSERT_EQ("2", value);
+  delete copy;
+  ASSERT_LEVELDB_OK(DestroyDB(ckpt, options));
+
+  // The original still has its newer data.
+  ASSERT_EQ("3", Get("a"));
+  ASSERT_EQ("NOT_FOUND", Get("c"));
+}
+
 TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ(config::kMaxMemCompactLevel, 2)
       << "Need to update this test to match kMaxMemCompactLevel";

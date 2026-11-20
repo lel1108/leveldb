@@ -309,6 +309,87 @@ void DBImpl::ReleaseFileDeletions() {
   RemoveObsoleteFiles();
 }
 
+Status DBImpl::PrepareCheckpoint(CheckpointPlan* plan) {
+  MutexLock l(&mutex_);
+
+  // (1) Wait until no background work is running. A compaction or memtable
+  // flush releases mutex_ while it appends to the MANIFEST, so while one is
+  // running the MANIFEST may already name a new table file that is not yet
+  // in the current version. Once we hold mutex_ with nothing scheduled, no
+  // background work can start until we release mutex_.
+  while (background_compaction_scheduled_) {
+    background_work_finished_signal_.Wait();
+  }
+  if (!bg_error_.ok()) {
+    return bg_error_;
+  }
+  if (file_deletions_held_) {
+    return Status::NotSupported("another checkpoint is in progress");
+  }
+
+  // (2) Which files does the checkpoint need?
+  //  - Table files that belong to the current version. They never change
+  //    once written, so they can be hard-linked.
+  //  - Log files still needed for recovery: every log numbered at or above
+  //    versions_->LogNumber(). Closed ones never change again either.
+  // We walk the directory instead of building names ourselves because old
+  // databases may still use the ".sst" table suffix.
+  std::set<uint64_t> live_tables;
+  versions_->AddLiveFiles(&live_tables);
+
+  std::vector<std::string> children;
+  Status s = env_->GetChildren(dbname_, &children);
+  if (!s.ok()) {
+    return s;
+  }
+  plan->link_files.clear();
+  uint64_t number;
+  FileType type;
+  for (const std::string& name : children) {
+    if (!ParseFileName(name, &number, &type)) {
+      continue;
+    }
+    if (type == kTableFile && live_tables.count(number) > 0) {
+      plan->link_files.push_back(name);
+    } else if (type == kLogFile && number >= versions_->LogNumber() &&
+               number != logfile_number_) {
+      plan->link_files.push_back(name);
+    }
+  }
+
+  // (3) The log being written may still grow, so remember its size now.
+  // A write in progress may leave half a record at that point; recovery
+  // ignores a half-written record at the end of a log, so the copy is still
+  // consistent: it holds every write that finished before this call.
+  plan->live_log_file = LogFileName("", logfile_number_).substr(1);
+  s = env_->GetFileSize(dbname_ + "/" + plan->live_log_file,
+                        &plan->live_log_size);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // (4) The MANIFEST in use and its current size. Nothing appends to it
+  // while we hold mutex_ with no background work running.
+  plan->manifest_file =
+      DescriptorFileName("", versions_->ManifestFileNumber()).substr(1);
+  s = env_->GetFileSize(dbname_ + "/" + plan->manifest_file,
+                        &plan->manifest_size);
+  if (!s.ok()) {
+    return s;
+  }
+
+  // (5) Keep every file above on disk until FinishCheckpoint().
+  HoldFileDeletions();
+  return Status::OK();
+}
+
+void DBImpl::FinishCheckpoint() {
+  MutexLock l(&mutex_);
+  if (file_deletions_held_) {
+    ReleaseFileDeletions();
+  }
+}
+
 void DBImpl::TEST_HoldFileDeletions() {
   MutexLock l(&mutex_);
   HoldFileDeletions();
