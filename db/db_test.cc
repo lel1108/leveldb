@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <string>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include "db/db_impl.h"
@@ -135,6 +136,11 @@ class SpecialEnv : public EnvWrapper {
   // Force write to manifest files to fail while this pointer is non-null.
   std::atomic<bool> manifest_write_error_;
 
+  // MANIFEST Sync() calls block while this is true. manifest_sync_waiting_
+  // is true while a Sync() call is blocked here.
+  std::atomic<bool> delay_manifest_sync_;
+  std::atomic<bool> manifest_sync_waiting_;
+
   // Force log file close to fail while this bool is true.
   std::atomic<bool> log_file_close_;
 
@@ -149,6 +155,8 @@ class SpecialEnv : public EnvWrapper {
         non_writable_(false),
         manifest_sync_error_(false),
         manifest_write_error_(false),
+        delay_manifest_sync_(false),
+        manifest_sync_waiting_(false),
         log_file_close_(false),
         count_random_reads_(false) {}
 
@@ -211,9 +219,15 @@ class SpecialEnv : public EnvWrapper {
       Status Sync() {
         if (env_->manifest_sync_error_.load(std::memory_order_acquire)) {
           return Status::IOError("simulated sync error");
-        } else {
-          return base_->Sync();
         }
+        if (env_->delay_manifest_sync_.load(std::memory_order_acquire)) {
+          env_->manifest_sync_waiting_.store(true, std::memory_order_release);
+          while (env_->delay_manifest_sync_.load(std::memory_order_acquire)) {
+            env_->SleepForMicroseconds(1000);
+          }
+          env_->manifest_sync_waiting_.store(false, std::memory_order_release);
+        }
+        return base_->Sync();
       }
     };
 
@@ -1745,6 +1759,39 @@ TEST_F(DBTest, PrepareCheckpointPlanOpensAsCopy) {
   // The original still has its newer data.
   ASSERT_EQ("3", Get("a"));
   ASSERT_EQ("NOT_FOUND", Get("c"));
+}
+
+// FinishCheckpoint() must not clean up files while a memtable flush is
+// installing its new table. That table is no longer in pending_outputs_ but
+// not yet in the current version, so cleaning up then would delete it.
+TEST_F(DBTest, FinishCheckpointDoesNotDeleteTableBeingInstalled) {
+  Options options = CurrentOptions();
+  options.env = env_;  // so the MANIFEST sync hook below applies
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("a", "1"));
+  CheckpointPlan plan;
+  ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
+  ASSERT_LEVELDB_OK(Put("b", "2"));
+
+  // Start a flush and stop it while it syncs the MANIFEST (mutex_ released).
+  env_->delay_manifest_sync_.store(true);
+  std::thread flusher([&]() { dbfull()->TEST_CompactMemTable(); });
+  while (!env_->manifest_sync_waiting_.load()) {
+    env_->SleepForMicroseconds(1000);
+  }
+
+  // Release the hold while the flush is stuck in the middle.
+  std::thread finisher([&]() { dbfull()->FinishCheckpoint(); });
+  env_->SleepForMicroseconds(200000);
+  env_->delay_manifest_sync_.store(false);
+  flusher.join();
+  finisher.join();
+
+  // The flushed table must still be there.
+  ASSERT_EQ("1", Get("a"));
+  ASSERT_EQ("2", Get("b"));
+  Reopen(&options);
+  ASSERT_EQ("2", Get("b"));
 }
 
 TEST_F(DBTest, ManualCompaction) {

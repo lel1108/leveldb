@@ -305,7 +305,16 @@ void DBImpl::HoldFileDeletions() {
 void DBImpl::ReleaseFileDeletions() {
   mutex_.AssertHeld();
   file_deletions_held_ = false;
-  // Delete whatever became obsolete while the hold was active.
+
+  // Delete whatever became obsolete while the hold was active, but only once
+  // no background work is running. RemoveObsoleteFiles() is normally called
+  // by the background thread itself. A memtable flush releases mutex_ while
+  // it writes the MANIFEST, after its new table has left pending_outputs_
+  // and before that table is in the current version; cleaning up from this
+  // thread at that moment would delete the new table and lose its data.
+  while (background_compaction_scheduled_) {
+    background_work_finished_signal_.Wait();
+  }
   RemoveObsoleteFiles();
 }
 
@@ -349,7 +358,7 @@ Status DBImpl::PrepareCheckpoint(CheckpointPlan* plan) {
     if (!ParseFileName(name, &number, &type)) {
       continue;
     }
-    if (type == kTableFile && live_tables.count(number) > 0) {
+    if (type == kTableFile && live_tables.erase(number) > 0) {
       plan->link_files.push_back(name);
     } else if (type == kLogFile && number >= versions_->LogNumber() &&
                number != logfile_number_) {
@@ -357,7 +366,13 @@ Status DBImpl::PrepareCheckpoint(CheckpointPlan* plan) {
     }
   }
 
-  // (3) The log being written may still grow, so remember its size now.
+    if (!live_tables.empty()) {
+    // A table the database needs is missing from its directory. A copy
+    // without it could not be opened, so do not pretend to make one.
+    return Status::Corruption("checkpoint: live table file missing");
+  }
+
+// (3) The log being written may still grow, so remember its size now.
   // A write in progress may leave half a record at that point; recovery
   // ignores a half-written record at the end of a log, so the copy is still
   // consistent: it holds every write that finished before this call.
