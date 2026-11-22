@@ -1794,6 +1794,113 @@ TEST_F(DBTest, FinishCheckpointDoesNotDeleteTableBeingInstalled) {
   ASSERT_EQ("2", Get("b"));
 }
 
+// Checkpoint while another thread keeps writing. The copy must open, hold
+// every write that finished before PrepareCheckpoint(), and never hold half
+// of a write batch.
+TEST_F(DBTest, CheckpointWhileWriting) {
+  Options options = CurrentOptions();
+  options.write_buffer_size = 64 << 10;  // small: flushes and compactions
+  Reopen(&options);                      // happen while the writer runs
+
+  std::atomic<bool> stop(false);
+  std::atomic<bool> failed(false);
+  std::atomic<int> done(0);  // number of batches whose Write() returned
+  std::thread writer([&]() {
+    const std::string filler(100, 'x');
+    for (int i = 0; !stop.load(); i++) {
+      // Each batch writes two keys. Atomicity means both or neither.
+      WriteBatch batch;
+      batch.Put(Key(i) + "a", filler + std::to_string(i));
+      batch.Put(Key(i) + "b", filler + std::to_string(i));
+      if (!db_->Write(WriteOptions(), &batch).ok()) {
+        failed.store(true);
+        break;
+      }
+      done.store(i + 1);
+    }
+  });
+  // Stop and join the writer however this test ends, even on a failed
+  // ASSERT, so a joinable std::thread never aborts the whole test run.
+  struct StopWriter {
+    std::atomic<bool>* stop;
+    std::thread* writer;
+    ~StopWriter() {
+      stop->store(true);
+      if (writer->joinable()) writer->join();
+    }
+  } stop_writer{&stop, &writer};
+
+  while (done.load() < 2000 && !failed.load()) {
+    env_->SleepForMicroseconds(1000);
+  }
+  ASSERT_FALSE(failed.load());
+
+  const int before = done.load();
+  CheckpointPlan plan;
+  ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
+  const int after = done.load();
+
+  // Let the writer go on (more flushes, maybe compactions) while we copy.
+  while (done.load() < after + 2000 && !failed.load()) {
+    env_->SleepForMicroseconds(1000);
+  }
+  ASSERT_FALSE(failed.load());
+
+  const std::string ckpt = dbname_ + "_ckpt";
+  DestroyDB(ckpt, Options());
+  ASSERT_LEVELDB_OK(env_->CreateDir(ckpt));
+  std::string data;
+  for (const std::string& name : plan.link_files) {
+    ASSERT_LEVELDB_OK(ReadFileToString(env_, dbname_ + "/" + name, &data));
+    ASSERT_LEVELDB_OK(WriteStringToFile(env_, data, ckpt + "/" + name));
+  }
+  ASSERT_LEVELDB_OK(
+      ReadFileToString(env_, dbname_ + "/" + plan.live_log_file, &data));
+  data.resize(plan.live_log_size);
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env_, data, ckpt + "/" + plan.live_log_file));
+  ASSERT_LEVELDB_OK(
+      ReadFileToString(env_, dbname_ + "/" + plan.manifest_file, &data));
+  data.resize(plan.manifest_size);
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env_, data, ckpt + "/" + plan.manifest_file));
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env_, plan.manifest_file + "\n", ckpt + "/CURRENT"));
+  dbfull()->FinishCheckpoint();
+
+  stop.store(true);
+  writer.join();
+  const int total = done.load();
+
+  DB* copy = nullptr;
+  Options copy_options;
+  copy_options.env = env_;
+  ASSERT_LEVELDB_OK(DB::Open(copy_options, ckpt, &copy));
+
+  // The batches in the copy must form an unbroken run from 0, and each
+  // batch must be complete (both keys) or absent (neither).
+  int in_copy = 0;
+  std::string va, vb;
+  for (int i = 0; i < total; i++) {
+    Status sa = copy->Get(ReadOptions(), Key(i) + "a", &va);
+    Status sb = copy->Get(ReadOptions(), Key(i) + "b", &vb);
+    ASSERT_EQ(sa.ok(), sb.ok()) << "half of batch " << i;
+    if (!sa.ok()) break;
+    ASSERT_EQ(va, vb);
+    in_copy = i + 1;
+  }
+  // Nothing written after the first missing batch is in the copy.
+  for (int i = in_copy; i < total; i++) {
+    ASSERT_TRUE(copy->Get(ReadOptions(), Key(i) + "a", &va).IsNotFound())
+        << "batch " << i << " is after a gap";
+  }
+  ASSERT_GE(in_copy, before);     // every finished write is there
+  ASSERT_LE(in_copy, after + 1);  // nothing written after the checkpoint
+
+  delete copy;
+  ASSERT_LEVELDB_OK(DestroyDB(ckpt, copy_options));
+}
+
 TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ(config::kMaxMemCompactLevel, 2)
       << "Need to update this test to match kMaxMemCompactLevel";
