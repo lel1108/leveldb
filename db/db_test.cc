@@ -1901,6 +1901,22 @@ TEST_F(DBTest, CheckpointWhileWriting) {
   ASSERT_LEVELDB_OK(DestroyDB(ckpt, copy_options));
 }
 
+// Checkpoint: CreateCheckpoint() must release the deletion hold even when
+// the file layer fails (here: not implemented yet), so a later checkpoint
+// can start and obsolete files are deleted again.
+TEST_F(DBTest, CreateCheckpointReleasesHoldOnFailure) {
+  ASSERT_LEVELDB_OK(Put("a", "1"));
+  const std::string ckpt = dbname_ + "_ckpt";
+  Status s = db_->CreateCheckpoint(ckpt);
+  ASSERT_FALSE(s.ok());
+
+  // The hold was released: preparing another checkpoint works.
+  CheckpointPlan plan;
+  ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
+  dbfull()->FinishCheckpoint();
+  ASSERT_EQ("1", Get("a"));
+}
+
 TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ(config::kMaxMemCompactLevel, 2)
       << "Need to update this test to match kMaxMemCompactLevel";

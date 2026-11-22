@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "leveldb/status.h"
 
 namespace leveldb {
 
@@ -30,6 +31,17 @@ struct CheckpointPlan {
   uint64_t manifest_size = 0;
 };
 
+class Env;
+
+// Checkpoint, file-layer part: carry out *plan. Copies the files it lists
+// from db_dir into a new directory checkpoint_dir and writes the copy's
+// CURRENT file. Hard-links where possible, copies otherwise. Must leave no
+// half-built checkpoint_dir behind if it fails (build it under a temporary
+// name, sync it, then rename it into place).
+// Implemented in db/checkpoint.cc.
+Status ExecuteCheckpoint(Env* env, const CheckpointPlan& plan,
+                         const std::string& db_dir,
+                         const std::string& checkpoint_dir);
 }  // namespace leveldb
 
 #endif  // STORAGE_LEVELDB_DB_CHECKPOINT_H_

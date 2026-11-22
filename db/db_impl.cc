@@ -405,6 +405,25 @@ void DBImpl::FinishCheckpoint() {
   }
 }
 
+
+Status DBImpl::CreateCheckpoint(const std::string& checkpoint_dir) {
+  // (1) DB layer: decide what to copy and keep those files on disk.
+  CheckpointPlan plan;
+  Status s = PrepareCheckpoint(&plan);
+  if (!s.ok()) {
+    return s;  // nothing is held yet, so nothing to release
+  }
+
+  // (2) File layer: link or copy the files into checkpoint_dir.
+  // The database keeps serving reads and writes meanwhile.
+  s = ExecuteCheckpoint(env_, plan, dbname_, checkpoint_dir);
+
+  // (3) Always release the hold, even if (2) failed. Otherwise obsolete
+  // files would never be deleted again.
+  FinishCheckpoint();
+  return s;
+}
+
 void DBImpl::TEST_HoldFileDeletions() {
   MutexLock l(&mutex_);
   HoldFileDeletions();
@@ -1625,6 +1644,11 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
 }
 
 DB::~DB() = default;
+
+
+Status DB::CreateCheckpoint(const std::string& checkpoint_dir) {
+  return Status::NotSupported("CreateCheckpoint not supported");
+}
 
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
