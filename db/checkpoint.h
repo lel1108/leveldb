@@ -37,7 +37,8 @@ class Env;
 // from db_dir into a new directory checkpoint_dir and writes the copy's
 // CURRENT file. Hard-links where possible, copies otherwise. Must leave no
 // half-built checkpoint_dir behind if it fails (build it under a temporary
-// name, sync it, then rename it into place).
+// name, sync it, then rename it into place). If checkpoint_dir already
+// exists, must fail and change nothing.
 // Implemented in db/checkpoint.cc.
 Status ExecuteCheckpoint(Env* env, const CheckpointPlan& plan,
                          const std::string& db_dir,

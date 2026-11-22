@@ -1907,9 +1907,12 @@ TEST_F(DBTest, CheckpointWhileWriting) {
 TEST_F(DBTest, CreateCheckpointReleasesHoldOnFailure) {
   ASSERT_LEVELDB_OK(Put("a", "1"));
   const std::string ckpt = dbname_ + "_ckpt";
+  // checkpoint_dir must not exist yet. Make it exist, so this call fails
+  // whether or not the file layer is implemented.
+  env_->CreateDir(ckpt);
   Status s = db_->CreateCheckpoint(ckpt);
+  env_->RemoveDir(ckpt);
   ASSERT_FALSE(s.ok());
-
   // The hold was released: preparing another checkpoint works.
   CheckpointPlan plan;
   ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
