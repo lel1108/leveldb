@@ -20,12 +20,15 @@ static void InitTypeCrc(uint32_t* type_crc) {
   }
 }
 
-Writer::Writer(WritableFile* dest) : dest_(dest), block_offset_(0) {
+Writer::Writer(WritableFile* dest)
+    : dest_(dest), block_offset_(0), file_size_(0) {
   InitTypeCrc(type_crc_);
 }
 
 Writer::Writer(WritableFile* dest, uint64_t dest_length)
-    : dest_(dest), block_offset_(dest_length % kBlockSize) {
+    : dest_(dest),
+      block_offset_(dest_length % kBlockSize),
+      file_size_(dest_length) {
   InitTypeCrc(type_crc_);
 }
 
@@ -49,6 +52,7 @@ Status Writer::AddRecord(const Slice& slice) {
         // Fill the trailer (literal below relies on kHeaderSize being 7)
         static_assert(kHeaderSize == 7, "");
         dest_->Append(Slice("\x00\x00\x00\x00\x00\x00", leftover));
+        file_size_ += leftover;
       }
       block_offset_ = 0;
     }
@@ -104,6 +108,7 @@ Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr,
     }
   }
   block_offset_ += kHeaderSize + length;
+  file_size_ += kHeaderSize + length;
   return s;
 }
 

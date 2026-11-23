@@ -142,9 +142,11 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       logfile_(nullptr),
       logfile_number_(0),
       log_(nullptr),
+      logfile_committed_size_(0),
       seed_(0),
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
+      file_deletions_held_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
@@ -225,6 +227,12 @@ void DBImpl::MaybeIgnoreError(Status* s) const {
 void DBImpl::RemoveObsoleteFiles() {
   mutex_.AssertHeld();
 
+  if (file_deletions_held_) {
+    // A checkpoint is copying files. Keep everything on disk for now;
+    // ReleaseFileDeletions() runs this function again when it finishes.
+    return;
+  }
+
   if (!bg_error_.ok()) {
     // After a background error, we don't know whether a new version may
     // or may not have been committed, so we cannot safely garbage collect.
@@ -287,6 +295,137 @@ void DBImpl::RemoveObsoleteFiles() {
     env_->RemoveFile(dbname_ + "/" + filename);
   }
   mutex_.Lock();
+}
+
+void DBImpl::HoldFileDeletions() {
+  mutex_.AssertHeld();
+  assert(!file_deletions_held_);  // one checkpoint at a time
+  file_deletions_held_ = true;
+}
+
+void DBImpl::ReleaseFileDeletions() {
+  mutex_.AssertHeld();
+  file_deletions_held_ = false;
+
+  // Delete whatever became obsolete while the hold was active, but only if
+  // no background work is running. RemoveObsoleteFiles() is normally called
+  // by the background thread itself. A memtable flush releases mutex_ while
+  // it writes the MANIFEST, after its new table has left pending_outputs_
+  // and before that table is in the current version; cleaning up from this
+  // thread at that moment would delete the new table and lose its data.
+  // If background work is running, we do not wait for it (it may go on for
+  // a long time while writes keep coming): the background thread deletes
+  // these files the next time it cleans up.
+  if (!background_compaction_scheduled_) {
+    RemoveObsoleteFiles();
+  }
+}
+
+Status DBImpl::PrepareCheckpoint(CheckpointPlan* plan) {
+  MutexLock l(&mutex_);
+
+  if (!bg_error_.ok()) {
+    return bg_error_;
+  }
+  if (file_deletions_held_) {
+    return Status::NotSupported("another checkpoint is in progress");
+  }
+
+  // (1) We hold mutex_ from here to the end, so the plan describes one
+  // instant. We do not wait for background work (a flush or compaction may
+  // be running with mutex_ released, and under heavy writes there may never
+  // be a moment without one). Whatever it has not finished is simply not in
+  // the checkpoint: a new table that is not in the current version yet is
+  // not listed, and a MANIFEST edit or log record still being written lies
+  // beyond the committed sizes used in (3) and (4).
+
+  // (2) Which files does the checkpoint need?
+  //  - Table files that belong to the current version. They never change
+  //    once written, so they can be hard-linked.
+  //  - Log files still needed for recovery: every log numbered at or above
+  //    versions_->LogNumber(). Closed ones never change again either.
+  // We walk the directory instead of building names ourselves because old
+  // databases may still use the ".sst" table suffix.
+  std::set<uint64_t> live_tables;
+  versions_->AddLiveFiles(&live_tables);
+
+  std::vector<std::string> children;
+  Status s = env_->GetChildren(dbname_, &children);
+  if (!s.ok()) {
+    return s;
+  }
+  plan->link_files.clear();
+  uint64_t number;
+  FileType type;
+  for (const std::string& name : children) {
+    if (!ParseFileName(name, &number, &type)) {
+      continue;
+    }
+    if (type == kTableFile && live_tables.erase(number) > 0) {
+      plan->link_files.push_back(name);
+    } else if (type == kLogFile && number >= versions_->LogNumber() &&
+               number != logfile_number_) {
+      plan->link_files.push_back(name);
+    }
+  }
+
+    if (!live_tables.empty()) {
+    // A table the database needs is missing from its directory. A copy
+    // without it could not be opened, so do not pretend to make one.
+    return Status::Corruption("checkpoint: live table file missing");
+  }
+
+  // (3) The log being written, up to the end of the last write that has
+  // completed. A write still being appended is not in the checkpoint, and
+  // the copy never ends in the middle of a log record.
+  plan->live_log_file = LogFileName("", logfile_number_).substr(1);
+  plan->live_log_size = logfile_committed_size_;
+
+  // (4) The MANIFEST in use, up to the end of the last edit that has been
+  // applied to the current version.
+  plan->manifest_file =
+      DescriptorFileName("", versions_->ManifestFileNumber()).substr(1);
+  plan->manifest_size = versions_->ManifestCommittedSize();
+
+  // (5) Keep every file above on disk until FinishCheckpoint().
+  HoldFileDeletions();
+  return Status::OK();
+}
+
+void DBImpl::FinishCheckpoint() {
+  MutexLock l(&mutex_);
+  if (file_deletions_held_) {
+    ReleaseFileDeletions();
+  }
+}
+
+
+Status DBImpl::CreateCheckpoint(const std::string& checkpoint_dir) {
+  // (1) DB layer: decide what to copy and keep those files on disk.
+  CheckpointPlan plan;
+  Status s = PrepareCheckpoint(&plan);
+  if (!s.ok()) {
+    return s;  // nothing is held yet, so nothing to release
+  }
+
+  // (2) File layer: link or copy the files into checkpoint_dir.
+  // The database keeps serving reads and writes meanwhile.
+  s = ExecuteCheckpoint(env_, plan, dbname_, checkpoint_dir);
+
+  // (3) Always release the hold, even if (2) failed. Otherwise obsolete
+  // files would never be deleted again.
+  FinishCheckpoint();
+  return s;
+}
+
+void DBImpl::TEST_HoldFileDeletions() {
+  MutexLock l(&mutex_);
+  HoldFileDeletions();
+}
+
+void DBImpl::TEST_ReleaseFileDeletions() {
+  MutexLock l(&mutex_);
+  ReleaseFileDeletions();
 }
 
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
@@ -478,6 +617,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
         env_->NewAppendableFile(fname, &logfile_).ok()) {
       Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
       log_ = new log::Writer(logfile_, lfile_size);
+      logfile_committed_size_ = lfile_size;
       logfile_number_ = log_number;
       if (mem != nullptr) {
         mem_ = mem;
@@ -1245,6 +1385,10 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
       mutex_.Lock();
+      if (status.ok()) {
+        // The whole group is in the log now.
+        logfile_committed_size_ = log_->file_size();
+      }
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
@@ -1393,6 +1537,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       logfile_ = lfile;
       logfile_number_ = new_log_number;
       log_ = new log::Writer(lfile);
+      logfile_committed_size_ = 0;
       imm_ = mem_;
       has_imm_.store(true, std::memory_order_release);
       mem_ = new MemTable(internal_comparator_);
@@ -1499,6 +1644,11 @@ Status DB::Delete(const WriteOptions& opt, const Slice& key) {
 }
 
 DB::~DB() = default;
+
+
+Status DB::CreateCheckpoint(const std::string& checkpoint_dir) {
+  return Status::NotSupported("CreateCheckpoint not supported");
+}
 
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;

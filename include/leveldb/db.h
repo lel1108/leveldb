@@ -145,6 +145,16 @@ class LEVELDB_EXPORT DB {
   // Therefore the following call will compact the entire database:
   //    db->CompactRange(nullptr, nullptr);
   virtual void CompactRange(const Slice* begin, const Slice* end) = 0;
+
+  // Create a checkpoint: a copy of the database as of this call, in the
+  // directory checkpoint_dir, which must not exist yet. The copy can be
+  // opened with DB::Open(). Reads and writes to this database may continue
+  // while the checkpoint is being created. Table files are hard-linked when
+  // possible, so the copy takes little time and space on the same file
+  // system. Only one checkpoint can be created at a time.
+  //
+  // The default implementation returns NotSupported.
+  virtual Status CreateCheckpoint(const std::string& checkpoint_dir);
 };
 
 // Destroy the contents of the specified database.

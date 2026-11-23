@@ -36,11 +36,16 @@ class Writer {
 
   Status AddRecord(const Slice& slice);
 
+  // Length of the file: what it held when this Writer was created plus
+  // every byte this Writer has appended since.
+  uint64_t file_size() const { return file_size_; }
+
  private:
   Status EmitPhysicalRecord(RecordType type, const char* ptr, size_t length);
 
   WritableFile* dest_;
   int block_offset_;  // Current offset in block
+  uint64_t file_size_;
 
   // crc32c values for all supported record types.  These are
   // pre-computed to reduce the overhead of computing the crc of the
