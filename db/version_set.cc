@@ -740,6 +740,7 @@ VersionSet::VersionSet(const std::string& dbname, const Options* options,
       icmp_(*cmp),
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
+      manifest_committed_size_(0),
       last_sequence_(0),
       log_number_(0),
       prev_log_number_(0),
@@ -844,6 +845,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     AppendVersion(v);
     log_number_ = edit->log_number_;
     prev_log_number_ = edit->prev_log_number_;
+    manifest_committed_size_ = descriptor_log_->file_size();
   } else {
     delete v;
     if (!new_manifest_file.empty()) {
@@ -1018,6 +1020,7 @@ bool VersionSet::ReuseManifest(const std::string& dscname,
 
   Log(options_->info_log, "Reusing MANIFEST %s\n", dscname.c_str());
   descriptor_log_ = new log::Writer(descriptor_file_, manifest_size);
+  manifest_committed_size_ = manifest_size;
   manifest_file_number_ = manifest_number;
   return true;
 }

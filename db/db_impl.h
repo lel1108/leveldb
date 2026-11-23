@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 
+#include "db/checkpoint.h"
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
@@ -48,6 +49,7 @@ class DBImpl : public DB {
   bool GetProperty(const Slice& property, std::string* value) override;
   void GetApproximateSizes(const Range* range, int n, uint64_t* sizes) override;
   void CompactRange(const Slice* begin, const Slice* end) override;
+  Status CreateCheckpoint(const std::string& checkpoint_dir) override;
 
   // Extra methods (for testing) that are not in the public DB interface
 
@@ -65,6 +67,20 @@ class DBImpl : public DB {
   // Return the maximum overlapping data (in bytes) at next level for any
   // file at a level >= 1.
   int64_t TEST_MaxNextLevelOverlappingBytes();
+
+  // Checkpoint, DB-layer part.
+  // PrepareCheckpoint() fills *plan with every file the checkpoint needs and
+  // how many bytes of each append-only file to copy, all taken at one
+  // instant, then holds file deletions so those files stay on disk.
+  // FinishCheckpoint() must be called afterwards, whether copying the files
+  // succeeded or not: it releases the hold.
+  Status PrepareCheckpoint(CheckpointPlan* plan);
+  void FinishCheckpoint();
+  
+// Checkpoint support: while a hold is active, obsolete files are kept on
+  // disk instead of being deleted, so a checkpoint can still link them.
+  void TEST_HoldFileDeletions();
+  void TEST_ReleaseFileDeletions();
 
   // Record a sample of bytes read at the specified internal key.
   // Samples are taken approximately once every config::kReadBytesPeriod
@@ -117,6 +133,8 @@ class DBImpl : public DB {
 
   // Delete any unneeded files and stale in-memory entries.
   void RemoveObsoleteFiles() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void HoldFileDeletions() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void ReleaseFileDeletions() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Compact the in-memory write buffer to disk.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
@@ -180,6 +198,9 @@ class DBImpl : public DB {
   WritableFile* logfile_;
   uint64_t logfile_number_ GUARDED_BY(mutex_);
   log::Writer* log_;
+  // Size of the log file up to the end of the last write that has
+  // completed. A write still in log_->AddRecord() lies beyond this size.
+  uint64_t logfile_committed_size_ GUARDED_BY(mutex_);
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
 
   // Queue of writers.
@@ -194,6 +215,10 @@ class DBImpl : public DB {
 
   // Has a background compaction been scheduled or is running?
   bool background_compaction_scheduled_ GUARDED_BY(mutex_);
+
+  // True while a checkpoint is copying files. RemoveObsoleteFiles() does
+  // nothing while this is set. Only one checkpoint may run at a time.
+  bool file_deletions_held_ GUARDED_BY(mutex_);
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 
