@@ -4,6 +4,7 @@
 
 #include "helpers/memenv/memenv.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,46 @@ TEST_F(MemEnvTest, Basics) {
   ASSERT_LEVELDB_OK(env_->GetChildren("/dir", &children));
   ASSERT_EQ(0, children.size());
   ASSERT_LEVELDB_OK(env_->RemoveDir("/dir"));
+}
+
+TEST_F(MemEnvTest, LinkFileNotSupportedDoesNotForwardOrChangeFiles) {
+  class BaseEnv : public EnvWrapper {
+   public:
+    BaseEnv() : EnvWrapper(nullptr) {}
+    MOCK_METHOD(Status, LinkFile,
+                (const std::string& src, const std::string& target),
+                (override));
+  } base;
+  EXPECT_CALL(base, LinkFile(testing::_, testing::_)).Times(0);
+  std::unique_ptr<Env> env(NewMemEnv(&base));
+
+  ASSERT_LEVELDB_OK(WriteStringToFile(env.get(), "source data", "/source"));
+  ASSERT_LEVELDB_OK(WriteStringToFile(env.get(), "keep target", "/existing"));
+  EXPECT_TRUE(env->LinkFile("/source", "/target").IsNotSupportedError());
+  EXPECT_TRUE(env->LinkFile("/source", "/existing").IsNotSupportedError());
+  EXPECT_TRUE(env->LinkFile("/missing", "/target").IsNotSupportedError());
+  EXPECT_FALSE(env->FileExists("/target"));
+  std::string contents;
+  ASSERT_LEVELDB_OK(ReadFileToString(env.get(), "/source", &contents));
+  EXPECT_EQ("source data", contents);
+  ASSERT_LEVELDB_OK(ReadFileToString(env.get(), "/existing", &contents));
+  EXPECT_EQ("keep target", contents);
+}
+
+TEST_F(MemEnvTest, SyncDirNotSupportedDoesNotForward) {
+  class BaseEnv : public EnvWrapper {
+   public:
+    BaseEnv() : EnvWrapper(nullptr) {}
+    MOCK_METHOD(Status, SyncDir, (const std::string& dir), (override));
+  } base;
+  EXPECT_CALL(base, SyncDir(testing::_)).Times(0);
+  std::unique_ptr<Env> env(NewMemEnv(&base));
+  ASSERT_LEVELDB_OK(
+      WriteStringToFile(env.get(), "contents", "/directory/file"));
+  EXPECT_TRUE(env->SyncDir("/directory").IsNotSupportedError());
+  std::string contents;
+  ASSERT_LEVELDB_OK(ReadFileToString(env.get(), "/directory/file", &contents));
+  EXPECT_EQ("contents", contents);
 }
 
 TEST_F(MemEnvTest, ReadWrite) {

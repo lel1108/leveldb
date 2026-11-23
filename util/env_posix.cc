@@ -636,6 +636,45 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  Status SyncDir(const std::string& dirname) override {
+    int flags = O_RDONLY | kOpenBaseFlags;
+#if defined(O_DIRECTORY)
+    flags |= O_DIRECTORY;
+#endif
+    int fd;
+    do {
+      fd = ::open(dirname.c_str(), flags);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+      return PosixError(dirname, errno);
+    }
+
+    Status status;
+    struct ::stat file_stat;
+    int result;
+    do {
+      result = ::fstat(fd, &file_stat);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) {
+      status = PosixError(dirname, errno);
+    } else if (!S_ISDIR(file_stat.st_mode)) {
+      status = PosixError(dirname, ENOTDIR);
+    } else {
+      // Directory entries require fsync, not just file-data synchronization.
+      do {
+        result = ::fsync(fd);
+      } while (result != 0 && errno == EINTR);
+      if (result != 0) {
+        status = PosixError(dirname, errno);
+      }
+    }
+    // Do not retry close on EINTR: the descriptor may already be closed.
+    if (::close(fd) != 0 && status.ok()) {
+      status = PosixError(dirname, errno);
+    }
+    return status;
+  }
+
   Status GetFileSize(const std::string& filename, uint64_t* size) override {
     struct ::stat file_stat;
     if (::stat(filename.c_str(), &file_stat) != 0) {
@@ -649,6 +688,18 @@ class PosixEnv : public Env {
   Status RenameFile(const std::string& from, const std::string& to) override {
     if (std::rename(from.c_str(), to.c_str()) != 0) {
       return PosixError(from, errno);
+    }
+    return Status::OK();
+  }
+
+  Status LinkFile(const std::string& src, const std::string& target) override {
+    if (::link(src.c_str(), target.c_str()) != 0) {
+      const int error_number = errno;
+      const std::string context = src + " -> " + target;
+      if (error_number == EXDEV) {
+        return Status::NotSupported(context, std::strerror(error_number));
+      }
+      return PosixError(context, error_number);
     }
     return Status::OK();
   }

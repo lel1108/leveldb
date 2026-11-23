@@ -141,6 +141,11 @@ class LEVELDB_EXPORT Env {
   // Create the specified directory.
   virtual Status CreateDir(const std::string& dirname) = 0;
 
+  // Sync the named directory's entries to storage. This does not sync the
+  // contents of its files or recursively sync child directories. The path must
+  // name a directory. The default implementation returns NotSupported.
+  virtual Status SyncDir(const std::string& dirname);
+
   // Delete the specified directory.
   //
   // The default implementation calls DeleteDir, to support legacy Env
@@ -167,6 +172,16 @@ class LEVELDB_EXPORT Env {
   // Rename file src to target.
   virtual Status RenameFile(const std::string& src,
                             const std::string& target) = 0;
+
+  // Create a hard link named target to the existing file src. The target must
+  // not already exist. On success, both names refer to the same file; this does
+  // not copy the contents or synchronize the file or its directory to disk.
+  //
+  // Returns NotSupported if this Env does not implement hard links or if src
+  // and target are on different filesystems. Callers may choose to copy the
+  // file in that case. Other failures are returned without attempting a copy.
+  // The default implementation returns NotSupported.
+  virtual Status LinkFile(const std::string& src, const std::string& target);
 
   // Lock the specified file.  Used to prevent concurrent access to
   // the same db by multiple processes.  On failure, stores nullptr in
@@ -368,6 +383,7 @@ class LEVELDB_EXPORT EnvWrapper : public Env {
   Status CreateDir(const std::string& d) override {
     return target_->CreateDir(d);
   }
+  Status SyncDir(const std::string& d) override { return target_->SyncDir(d); }
   Status RemoveDir(const std::string& d) override {
     return target_->RemoveDir(d);
   }
@@ -376,6 +392,9 @@ class LEVELDB_EXPORT EnvWrapper : public Env {
   }
   Status RenameFile(const std::string& s, const std::string& t) override {
     return target_->RenameFile(s, t);
+  }
+  Status LinkFile(const std::string& s, const std::string& t) override {
+    return target_->LinkFile(s, t);
   }
   Status LockFile(const std::string& f, FileLock** l) override {
     return target_->LockFile(f, l);

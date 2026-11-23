@@ -27,7 +27,7 @@ TEST_F(EnvTest, ReadWrite) {
   // Get file to use for testing.
   std::string test_dir;
   ASSERT_LEVELDB_OK(env_->GetTestDirectory(&test_dir));
-  std::string test_file_name = test_dir + "/open_on_read.txt";
+  std::string test_file_name = test_dir + "/env_read_write.txt";
   WritableFile* writable_file;
   ASSERT_LEVELDB_OK(env_->NewWritableFile(test_file_name, &writable_file));
 
@@ -243,6 +243,55 @@ TEST_F(EnvTest, ReopenAppendableFile) {
   ASSERT_LEVELDB_OK(ReadFileToString(env_, test_file_name, &data));
   ASSERT_EQ(std::string("hello world!42"), data);
   env_->RemoveFile(test_file_name);
+}
+
+TEST_F(EnvTest, LinkFileDefaultNotSupported) {
+  // Explicitly call the base implementation without a backing filesystem.
+  EnvWrapper env(nullptr);
+  EXPECT_TRUE(env.Env::LinkFile("source", "target").IsNotSupportedError());
+}
+
+TEST_F(EnvTest, LinkFileWrapperForwardsArgumentsAndStatus) {
+  class LinkEnv : public EnvWrapper {
+   public:
+    LinkEnv() : EnvWrapper(nullptr) {}
+    MOCK_METHOD(Status, LinkFile,
+                (const std::string& src, const std::string& target),
+                (override));
+  } target;
+
+  EnvWrapper wrapper(&target);
+  Env* env = &wrapper;
+  const Status statuses[] = {
+      Status::OK(), Status::NotSupported("link unavailable"),
+      Status::NotFound("missing source"), Status::IOError("link failed")};
+  for (const Status& expected : statuses) {
+    EXPECT_CALL(target, LinkFile("source", "target"))
+        .WillOnce(testing::Return(expected));
+    EXPECT_EQ(expected.ToString(),
+              env->LinkFile("source", "target").ToString());
+  }
+}
+
+TEST_F(EnvTest, SyncDirDefaultNotSupported) {
+  EnvWrapper env(nullptr);
+  EXPECT_TRUE(env.Env::SyncDir("directory").IsNotSupportedError());
+}
+
+TEST_F(EnvTest, SyncDirWrapperForwardsArgumentsAndStatus) {
+  class DirectoryEnv : public EnvWrapper {
+   public:
+    DirectoryEnv() : EnvWrapper(nullptr) {}
+    MOCK_METHOD(Status, SyncDir, (const std::string& dir), (override));
+  } target;
+  EnvWrapper wrapper(&target);
+  for (const Status& expected :
+       {Status::OK(), Status::NotSupported("unsupported"),
+        Status::NotFound("missing"), Status::IOError("sync")}) {
+    EXPECT_CALL(target, SyncDir("directory"))
+        .WillOnce(testing::Return(expected));
+    EXPECT_EQ(expected.ToString(), wrapper.SyncDir("directory").ToString());
+  }
 }
 
 }  // namespace leveldb

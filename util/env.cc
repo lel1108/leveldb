@@ -22,6 +22,14 @@ Status Env::NewAppendableFile(const std::string& fname, WritableFile** result) {
   return Status::NotSupported("NewAppendableFile", fname);
 }
 
+Status Env::LinkFile(const std::string& src, const std::string& target) {
+  return Status::NotSupported("LinkFile", src + " -> " + target);
+}
+
+Status Env::SyncDir(const std::string& dirname) {
+  return Status::NotSupported("SyncDir", dirname);
+}
+
 Status Env::RemoveDir(const std::string& dirname) { return DeleteDir(dirname); }
 Status Env::DeleteDir(const std::string& dirname) { return RemoveDir(dirname); }
 
