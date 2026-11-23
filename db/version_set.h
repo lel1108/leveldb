@@ -190,6 +190,11 @@ class VersionSet {
   // Return the current manifest file number
   uint64_t ManifestFileNumber() const { return manifest_file_number_; }
 
+  // Size of the current MANIFEST up to the end of the last edit that has
+  // been applied to the current version. An edit that LogAndApply() is
+  // still writing (with *mu released) lies beyond this size.
+  uint64_t ManifestCommittedSize() const { return manifest_committed_size_; }
+
   // Allocate and return a new file number
   uint64_t NewFileNumber() { return next_file_number_++; }
 
@@ -300,6 +305,7 @@ class VersionSet {
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
+  uint64_t manifest_committed_size_;
   uint64_t last_sequence_;
   uint64_t log_number_;
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted

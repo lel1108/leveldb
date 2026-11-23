@@ -198,6 +198,9 @@ class DBImpl : public DB {
   WritableFile* logfile_;
   uint64_t logfile_number_ GUARDED_BY(mutex_);
   log::Writer* log_;
+  // Size of the log file up to the end of the last write that has
+  // completed. A write still in log_->AddRecord() lies beyond this size.
+  uint64_t logfile_committed_size_ GUARDED_BY(mutex_);
   uint32_t seed_ GUARDED_BY(mutex_);  // For sampling.
 
   // Queue of writers.

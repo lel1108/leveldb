@@ -142,6 +142,7 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       logfile_(nullptr),
       logfile_number_(0),
       log_(nullptr),
+      logfile_committed_size_(0),
       seed_(0),
       tmp_batch_(new WriteBatch),
       background_compaction_scheduled_(false),
@@ -306,35 +307,37 @@ void DBImpl::ReleaseFileDeletions() {
   mutex_.AssertHeld();
   file_deletions_held_ = false;
 
-  // Delete whatever became obsolete while the hold was active, but only once
+  // Delete whatever became obsolete while the hold was active, but only if
   // no background work is running. RemoveObsoleteFiles() is normally called
   // by the background thread itself. A memtable flush releases mutex_ while
   // it writes the MANIFEST, after its new table has left pending_outputs_
   // and before that table is in the current version; cleaning up from this
   // thread at that moment would delete the new table and lose its data.
-  while (background_compaction_scheduled_) {
-    background_work_finished_signal_.Wait();
+  // If background work is running, we do not wait for it (it may go on for
+  // a long time while writes keep coming): the background thread deletes
+  // these files the next time it cleans up.
+  if (!background_compaction_scheduled_) {
+    RemoveObsoleteFiles();
   }
-  RemoveObsoleteFiles();
 }
 
 Status DBImpl::PrepareCheckpoint(CheckpointPlan* plan) {
   MutexLock l(&mutex_);
 
-  // (1) Wait until no background work is running. A compaction or memtable
-  // flush releases mutex_ while it appends to the MANIFEST, so while one is
-  // running the MANIFEST may already name a new table file that is not yet
-  // in the current version. Once we hold mutex_ with nothing scheduled, no
-  // background work can start until we release mutex_.
-  while (background_compaction_scheduled_) {
-    background_work_finished_signal_.Wait();
-  }
   if (!bg_error_.ok()) {
     return bg_error_;
   }
   if (file_deletions_held_) {
     return Status::NotSupported("another checkpoint is in progress");
   }
+
+  // (1) We hold mutex_ from here to the end, so the plan describes one
+  // instant. We do not wait for background work (a flush or compaction may
+  // be running with mutex_ released, and under heavy writes there may never
+  // be a moment without one). Whatever it has not finished is simply not in
+  // the checkpoint: a new table that is not in the current version yet is
+  // not listed, and a MANIFEST edit or log record still being written lies
+  // beyond the committed sizes used in (3) and (4).
 
   // (2) Which files does the checkpoint need?
   //  - Table files that belong to the current version. They never change
@@ -372,26 +375,17 @@ Status DBImpl::PrepareCheckpoint(CheckpointPlan* plan) {
     return Status::Corruption("checkpoint: live table file missing");
   }
 
-// (3) The log being written may still grow, so remember its size now.
-  // A write in progress may leave half a record at that point; recovery
-  // ignores a half-written record at the end of a log, so the copy is still
-  // consistent: it holds every write that finished before this call.
+  // (3) The log being written, up to the end of the last write that has
+  // completed. A write still being appended is not in the checkpoint, and
+  // the copy never ends in the middle of a log record.
   plan->live_log_file = LogFileName("", logfile_number_).substr(1);
-  s = env_->GetFileSize(dbname_ + "/" + plan->live_log_file,
-                        &plan->live_log_size);
-  if (!s.ok()) {
-    return s;
-  }
+  plan->live_log_size = logfile_committed_size_;
 
-  // (4) The MANIFEST in use and its current size. Nothing appends to it
-  // while we hold mutex_ with no background work running.
+  // (4) The MANIFEST in use, up to the end of the last edit that has been
+  // applied to the current version.
   plan->manifest_file =
       DescriptorFileName("", versions_->ManifestFileNumber()).substr(1);
-  s = env_->GetFileSize(dbname_ + "/" + plan->manifest_file,
-                        &plan->manifest_size);
-  if (!s.ok()) {
-    return s;
-  }
+  plan->manifest_size = versions_->ManifestCommittedSize();
 
   // (5) Keep every file above on disk until FinishCheckpoint().
   HoldFileDeletions();
@@ -623,6 +617,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
         env_->NewAppendableFile(fname, &logfile_).ok()) {
       Log(options_.info_log, "Reusing old log %s \n", fname.c_str());
       log_ = new log::Writer(logfile_, lfile_size);
+      logfile_committed_size_ = lfile_size;
       logfile_number_ = log_number;
       if (mem != nullptr) {
         mem_ = mem;
@@ -1390,6 +1385,10 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
       mutex_.Lock();
+      if (status.ok()) {
+        // The whole group is in the log now.
+        logfile_committed_size_ = log_->file_size();
+      }
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
@@ -1538,6 +1537,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       logfile_ = lfile;
       logfile_number_ = new_log_number;
       log_ = new log::Writer(lfile);
+      logfile_committed_size_ = 0;
       imm_ = mem_;
       has_imm_.store(true, std::memory_order_release);
       mem_ = new MemTable(internal_comparator_);

@@ -141,6 +141,11 @@ class SpecialEnv : public EnvWrapper {
   std::atomic<bool> delay_manifest_sync_;
   std::atomic<bool> manifest_sync_waiting_;
 
+  // Log file Flush() calls block, after flushing, while this is true.
+  // log_flush_waiting_ is true while a Flush() call is blocked here.
+  std::atomic<bool> delay_log_flush_;
+  std::atomic<bool> log_flush_waiting_;
+
   // Force log file close to fail while this bool is true.
   std::atomic<bool> log_file_close_;
 
@@ -157,6 +162,8 @@ class SpecialEnv : public EnvWrapper {
         manifest_write_error_(false),
         delay_manifest_sync_(false),
         manifest_sync_waiting_(false),
+        delay_log_flush_(false),
+        log_flush_waiting_(false),
         log_file_close_(false),
         count_random_reads_(false) {}
 
@@ -188,7 +195,18 @@ class SpecialEnv : public EnvWrapper {
         }
         return s;
       }
-      Status Flush() { return base_->Flush(); }
+      Status Flush() {
+        Status s = base_->Flush();
+        if (IsLogFile(fname_) &&
+            env_->delay_log_flush_.load(std::memory_order_acquire)) {
+          env_->log_flush_waiting_.store(true, std::memory_order_release);
+          while (env_->delay_log_flush_.load(std::memory_order_acquire)) {
+            env_->SleepForMicroseconds(1000);
+          }
+          env_->log_flush_waiting_.store(false, std::memory_order_release);
+        }
+        return s;
+      }
       Status Sync() {
         if (env_->data_sync_error_.load(std::memory_order_acquire)) {
           return Status::IOError("simulated data sync error");
@@ -495,6 +513,41 @@ class DBTest : public testing::Test {
       if (f.size() > 4 && f.compare(f.size() - 4, 4, ".ldb") == 0) n++;
     }
     return n;
+  }
+
+  // Copies the first size bytes of file name from the DB directory to dir.
+  Status CopyFilePrefix(const std::string& name, uint64_t size,
+                        const std::string& dir) {
+    std::string data;
+    Status s = ReadFileToString(env_, dbname_ + "/" + name, &data);
+    if (s.ok() && size < data.size()) {
+      data.resize(size);
+    }
+    if (s.ok()) {
+      s = WriteStringToFile(env_, data, dir + "/" + name);
+    }
+    return s;
+  }
+
+  // Makes the checkpoint described by plan in dir, by plain copying only
+  // (the file layer links where it can). Lets these tests open a copy.
+  Status CopyCheckpointFiles(const CheckpointPlan& plan,
+                             const std::string& dir) {
+    DestroyDB(dir, Options());
+    Status s = env_->CreateDir(dir);
+    for (size_t i = 0; s.ok() && i < plan.link_files.size(); i++) {
+      s = CopyFilePrefix(plan.link_files[i], UINT64_MAX, dir);
+    }
+    if (s.ok()) {
+      s = CopyFilePrefix(plan.live_log_file, plan.live_log_size, dir);
+    }
+    if (s.ok()) {
+      s = CopyFilePrefix(plan.manifest_file, plan.manifest_size, dir);
+    }
+    if (s.ok()) {
+      s = WriteStringToFile(env_, plan.manifest_file + "\n", dir + "/CURRENT");
+    }
+    return s;
   }
 
   uint64_t Size(const Slice& start, const Slice& limit) {
@@ -1920,6 +1973,106 @@ TEST_F(DBTest, CreateCheckpointReleasesHoldOnFailure) {
   ASSERT_EQ("1", Get("a"));
 }
 
+// PrepareCheckpoint() and FinishCheckpoint() must not wait for background
+// work, which under heavy writes may never stop. Here a memtable flush is
+// stuck while it syncs the MANIFEST: its edit is in the file already, but
+// its table is not in the current version yet. The checkpoint must leave
+// that edit out and still hold every write. (If this test hangs, one of
+// them waits for background work again.)
+TEST_F(DBTest, CheckpointDuringFlush) {
+  Options options = CurrentOptions();
+  options.env = env_;  // so the MANIFEST sync hook below applies
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("a", "1"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());  // "a" is in a table
+  ASSERT_LEVELDB_OK(Put("b", "2"));                      // "b" is in the log
+
+  // Start a flush of "b" and stop it while it syncs the MANIFEST.
+  env_->delay_manifest_sync_.store(true);
+  std::thread flusher([&]() { dbfull()->TEST_CompactMemTable(); });
+  while (!env_->manifest_sync_waiting_.load()) {
+    env_->SleepForMicroseconds(1000);
+  }
+
+  // Make the whole checkpoint while the flush is stuck.
+  const std::string ckpt = dbname_ + "_ckpt";
+  CheckpointPlan plan;
+  uint64_t manifest_on_disk = 0;
+  Status s = dbfull()->PrepareCheckpoint(&plan);
+  if (s.ok()) {
+    env_->GetFileSize(dbname_ + "/" + plan.manifest_file, &manifest_on_disk);
+    s = CopyCheckpointFiles(plan, ckpt);
+    dbfull()->FinishCheckpoint();
+  }
+  env_->delay_manifest_sync_.store(false);
+  flusher.join();
+  ASSERT_LEVELDB_OK(s);
+  ASSERT_LT(plan.manifest_size, manifest_on_disk);  // stuck edit left out
+
+  DB* copy = nullptr;
+  Options copy_options;
+  copy_options.env = env_;
+  ASSERT_LEVELDB_OK(DB::Open(copy_options, ckpt, &copy));
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("1", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("2", value);
+  delete copy;
+  ASSERT_LEVELDB_OK(DestroyDB(ckpt, copy_options));
+  ASSERT_EQ("2", Get("b"));
+}
+
+// A write still being appended to the log is not in a checkpoint, and the
+// copy of the log never ends in the middle of a record. (If it did, opening
+// the copy with reuse_logs would append after the broken record, and the
+// next reopen would drop everything appended there.)
+TEST_F(DBTest, CheckpointExcludesWriteInProgress) {
+  Options options = CurrentOptions();
+  options.env = env_;  // so the log flush hook below applies
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("a", "1"));
+
+  // A value larger than a log block is written in pieces, with a flush
+  // after each. Stop that write after its first piece.
+  env_->delay_log_flush_.store(true);
+  std::thread writer([&]() { Put("big", std::string(100000, 'x')); });
+  while (!env_->log_flush_waiting_.load()) {
+    env_->SleepForMicroseconds(1000);
+  }
+  CheckpointPlan plan;
+  uint64_t log_on_disk = 0;
+  Status s = dbfull()->PrepareCheckpoint(&plan);
+  if (s.ok()) {
+    env_->GetFileSize(dbname_ + "/" + plan.live_log_file, &log_on_disk);
+  }
+  env_->delay_log_flush_.store(false);
+  writer.join();
+  ASSERT_LEVELDB_OK(s);
+  ASSERT_LT(plan.live_log_size, log_on_disk);  // part of "big" was on disk
+
+  const std::string ckpt = dbname_ + "_ckpt";
+  s = CopyCheckpointFiles(plan, ckpt);
+  dbfull()->FinishCheckpoint();
+  ASSERT_LEVELDB_OK(s);
+
+  // Open the copy in the way that would expose a broken last record.
+  Options copy_options;
+  copy_options.env = env_;
+  copy_options.reuse_logs = true;
+  copy_options.paranoid_checks = true;
+  DB* copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(copy_options, ckpt, &copy));
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "a", &value));
+  ASSERT_TRUE(copy->Get(ReadOptions(), "big", &value).IsNotFound());
+  ASSERT_LEVELDB_OK(copy->Put(WriteOptions(), "c", "3"));
+  delete copy;
+  ASSERT_LEVELDB_OK(DB::Open(copy_options, ckpt, &copy));
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "c", &value));
+  delete copy;
+  ASSERT_LEVELDB_OK(DestroyDB(ckpt, copy_options));
+}
 TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ(config::kMaxMemCompactLevel, 2)
       << "Need to update this test to match kMaxMemCompactLevel";
