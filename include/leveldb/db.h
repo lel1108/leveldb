@@ -153,6 +153,13 @@ class LEVELDB_EXPORT DB {
   // possible, so the copy takes little time and space on the same file
   // system. Only one checkpoint can be created at a time.
   //
+  // The parent directory must already exist and be durable. The caller must
+  // reserve checkpoint_dir and checkpoint_dir + ".tmp" for this operation;
+  // neither may already exist. The Env must support directory sync and atomic
+  // directory rename (currently provided by the POSIX Env). On failure, partial
+  // staging files are removed when possible. An error syncing the parent after
+  // rename leaves the complete checkpoint visible, with uncertain durability.
+  //
   // The default implementation returns NotSupported.
   virtual Status CreateCheckpoint(const std::string& checkpoint_dir);
 };

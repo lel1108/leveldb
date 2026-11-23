@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/checkpoint.h"
 #include "gtest/gtest.h"
 #include "leveldb/env.h"
 #include "port/port.h"
@@ -627,6 +628,386 @@ TEST_F(EnvPosixCheckpointTest, ErrorsAfterRenameKeepPublishedFiles) {
     ASSERT_LEVELDB_OK(env_->RemoveDir(checkpoint_));
     ExpectSourceUnchanged();
   }
+}
+
+class ExecuteCheckpointEnv : public EnvWrapper {
+ public:
+  enum Failure {
+    kNone,
+    kLinkUnsupported,
+    kAppendUnsupported,
+    kLinkError,
+    kLinkedSyncError,
+    kLinkedCloseError,
+    kCurrentAppendError,
+    kCurrentSyncError,
+    kCurrentCloseError,
+    kDirectorySyncUnsupported,
+    kStageSyncError,
+    kRenameError,
+    kParentSyncError
+  };
+
+  ExecuteCheckpointEnv(Env* target, const std::string& parent,
+                       const std::string& staging, Failure failure = kNone)
+      : EnvWrapper(target),
+        parent_(parent),
+        staging_(staging),
+        failure_(failure) {}
+
+  Status LinkFile(const std::string& src, const std::string& dst) override {
+    ++link_calls;
+    if (failure_ == kLinkUnsupported) {
+      return Status::NotSupported("injected link unsupported");
+    }
+    if (failure_ == kLinkError) {
+      return Status::IOError("injected link failure");
+    }
+    return target()->LinkFile(src, dst);
+  }
+
+  Status NewAppendableFile(const std::string& path,
+                           WritableFile** result) override {
+    *result = nullptr;
+    if (failure_ == kAppendUnsupported) {
+      return Status::NotSupported("injected append-open unsupported");
+    }
+    WritableFile* file;
+    Status status = target()->NewAppendableFile(path, &file);
+    if (status.ok()) *result = new LinkedFile(this, file);
+    return status;
+  }
+
+  Status NewWritableFile(const std::string& path,
+                         WritableFile** result) override {
+    Status status = target()->NewWritableFile(path, result);
+    if (status.ok() && path == staging_ + "/CURRENT") {
+      *result = new CurrentFile(this, *result);
+    }
+    return status;
+  }
+
+  Status CreateDir(const std::string& path) override {
+    ++create_dir_calls;
+    return target()->CreateDir(path);
+  }
+
+  Status SyncDir(const std::string& path) override {
+    if (failure_ == kDirectorySyncUnsupported) {
+      return Status::NotSupported("injected directory sync unsupported");
+    }
+    if ((failure_ == kStageSyncError && path == staging_) ||
+        (failure_ == kParentSyncError && renamed_ && path == parent_)) {
+      return Status::IOError("injected directory sync failure");
+    }
+    return target()->SyncDir(path);
+  }
+
+  Status RenameFile(const std::string& src, const std::string& dst) override {
+    if (failure_ == kRenameError) {
+      return Status::IOError("injected rename failure");
+    }
+    Status status = target()->RenameFile(src, dst);
+    if (status.ok()) renamed_ = true;
+    return status;
+  }
+
+  int link_calls = 0;
+  int linked_syncs = 0;
+  int linked_closes = 0;
+  int current_closes = 0;
+  int create_dir_calls = 0;
+
+ private:
+  // A linked inode may be synced through an append handle, but no bytes may
+  // be appended because that would also modify the original DB file.
+  class LinkedFile : public WritableFile {
+   public:
+    LinkedFile(ExecuteCheckpointEnv* env, WritableFile* file)
+        : env_(env), file_(file) {}
+    ~LinkedFile() override { delete file_; }
+
+    Status Append(const Slice&) override {
+      ADD_FAILURE() << "ExecuteCheckpoint appended to a linked file";
+      return Status::IOError("unexpected append to linked file");
+    }
+    Status Close() override {
+      ++env_->linked_closes;
+      const Status status = file_->Close();
+      if (status.ok() && env_->failure_ == kLinkedCloseError) {
+        return Status::IOError("injected linked file close failure");
+      }
+      return status;
+    }
+    Status Flush() override { return file_->Flush(); }
+    Status Sync() override {
+      ++env_->linked_syncs;
+      if (env_->failure_ == kLinkedSyncError) {
+        return Status::IOError("injected linked file sync failure");
+      }
+      return file_->Sync();
+    }
+
+   private:
+    ExecuteCheckpointEnv* const env_;
+    WritableFile* const file_;
+  };
+
+  class CurrentFile : public WritableFile {
+   public:
+    CurrentFile(ExecuteCheckpointEnv* env, WritableFile* file)
+        : env_(env), file_(file) {}
+    ~CurrentFile() override { delete file_; }
+
+    Status Append(const Slice& data) override {
+      if (env_->failure_ == kCurrentAppendError) {
+        return Status::IOError("injected CURRENT append failure");
+      }
+      return file_->Append(data);
+    }
+    Status Close() override {
+      ++env_->current_closes;
+      const Status status = file_->Close();
+      if (status.ok() && env_->failure_ == kCurrentCloseError) {
+        return Status::IOError("injected CURRENT close failure");
+      }
+      return status;
+    }
+    Status Flush() override { return file_->Flush(); }
+    Status Sync() override {
+      if (env_->failure_ == kCurrentSyncError) {
+        return Status::IOError("injected CURRENT sync failure");
+      }
+      return file_->Sync();
+    }
+
+   private:
+    ExecuteCheckpointEnv* const env_;
+    WritableFile* const file_;
+  };
+
+  const std::string parent_;
+  const std::string staging_;
+  const Failure failure_;
+  bool renamed_ = false;
+};
+
+class EnvPosixExecuteCheckpointTest : public EnvPosixDirectoryTest {
+ protected:
+  void SetUp() override {
+    ASSERT_NO_FATAL_FAILURE(EnvPosixDirectoryTest::SetUp());
+    ASSERT_LEVELDB_OK(env_->RemoveDir(staging_));
+    staging_ = checkpoint_ + ".tmp";
+    plan_.link_files = {"000001.ldb", "000002.log"};
+    plan_.live_log_file = "000003.log";
+    plan_.live_log_size = 4;
+    plan_.manifest_file = "MANIFEST-000004";
+    plan_.manifest_size = 8;
+    ASSERT_LEVELDB_OK(
+        WriteStringToFile(env_, "table contents", parent_ + "/000001.ldb"));
+    ASSERT_LEVELDB_OK(
+        WriteStringToFile(env_, "closed log", parent_ + "/000002.log"));
+    ASSERT_LEVELDB_OK(
+        WriteStringToFile(env_, "live-tail", parent_ + "/000003.log"));
+    ASSERT_LEVELDB_OK(
+        WriteStringToFile(env_, "manifest-tail", parent_ + "/MANIFEST-000004"));
+  }
+
+  void ExpectContents(const std::string& path, const std::string& expected) {
+    std::string contents;
+    ASSERT_LEVELDB_OK(ReadFileToString(env_, path, &contents));
+    EXPECT_EQ(expected, contents) << path;
+  }
+
+  void ExpectSourcesUnchanged() {
+    ExpectContents(parent_ + "/000001.ldb", "table contents");
+    ExpectContents(parent_ + "/000002.log", "closed log");
+    ExpectContents(parent_ + "/000003.log", "live-tail");
+    ExpectContents(parent_ + "/MANIFEST-000004", "manifest-tail");
+  }
+
+  void ExpectCompleteCheckpoint(bool linked) {
+    EXPECT_FALSE(env_->FileExists(staging_));
+    ExpectContents(checkpoint_ + "/000001.ldb", "table contents");
+    ExpectContents(checkpoint_ + "/000002.log", "closed log");
+    ExpectContents(checkpoint_ + "/000003.log", "live");
+    ExpectContents(checkpoint_ + "/MANIFEST-000004", "manifest");
+    ExpectContents(checkpoint_ + "/CURRENT", "MANIFEST-000004\n");
+    for (const char* name :
+         {"000001.ldb", "000002.log", "000003.log", "MANIFEST-000004"}) {
+      struct stat source_stat;
+      struct stat copy_stat;
+      ASSERT_EQ(0, ::stat((parent_ + "/" + name).c_str(), &source_stat));
+      ASSERT_EQ(0, ::stat((checkpoint_ + "/" + name).c_str(), &copy_stat));
+      const bool immutable = std::string(name) == "000001.ldb" ||
+                             std::string(name) == "000002.log";
+      EXPECT_EQ(linked && immutable, source_stat.st_ino == copy_stat.st_ino);
+    }
+    ExpectSourcesUnchanged();
+  }
+
+  void ExpectNoCheckpoint() {
+    EXPECT_FALSE(env_->FileExists(staging_));
+    EXPECT_FALSE(env_->FileExists(checkpoint_));
+    for (const std::string& name : plan_.link_files) {
+      struct stat source_stat;
+      ASSERT_EQ(0, ::stat((parent_ + "/" + name).c_str(), &source_stat));
+      EXPECT_EQ(1, source_stat.st_nlink);
+    }
+    ExpectSourcesUnchanged();
+  }
+
+  CheckpointPlan plan_;
+};
+
+TEST_F(EnvPosixExecuteCheckpointTest, LinksSyncsAndCopiesSelectedPrefixes) {
+  ExecuteCheckpointEnv checked(env_, parent_, staging_);
+  ASSERT_LEVELDB_OK(ExecuteCheckpoint(&checked, plan_, parent_, checkpoint_));
+  EXPECT_EQ(2, checked.link_calls);
+  EXPECT_EQ(2, checked.linked_syncs);
+  EXPECT_EQ(2, checked.linked_closes);
+  EXPECT_EQ(1, checked.current_closes);
+  ExpectCompleteCheckpoint(true);
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, UnsupportedLinksAreCopied) {
+  ExecuteCheckpointEnv checked(env_, parent_, staging_,
+                               ExecuteCheckpointEnv::kLinkUnsupported);
+  ASSERT_LEVELDB_OK(ExecuteCheckpoint(&checked, plan_, parent_, checkpoint_));
+  EXPECT_EQ(2, checked.link_calls);
+  EXPECT_EQ(0, checked.linked_syncs);
+  ExpectCompleteCheckpoint(false);
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, UnsupportedAppendOpenUnlinksBeforeCopy) {
+  ExecuteCheckpointEnv checked(env_, parent_, staging_,
+                               ExecuteCheckpointEnv::kAppendUnsupported);
+  ASSERT_LEVELDB_OK(ExecuteCheckpoint(&checked, plan_, parent_, checkpoint_));
+  EXPECT_EQ(2, checked.link_calls);
+  // Copying over a still-linked destination would truncate the source inode.
+  ExpectCompleteCheckpoint(false);
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, InvalidPlansCannotOverwriteSources) {
+  std::vector<CheckpointPlan> invalid;
+  for (const std::string& name :
+       {std::string("../000001.ldb"), std::string("CURRENT"),
+        std::string("000001.ldb\0suffix", 17), std::string("MANIFEST-000004"),
+        std::string("000001.ldb/child")}) {
+    CheckpointPlan plan = plan_;
+    plan.link_files.push_back(name);
+    invalid.push_back(plan);
+  }
+  CheckpointPlan duplicate = plan_;
+  duplicate.link_files.push_back(plan_.link_files[0]);
+  invalid.push_back(duplicate);
+  duplicate = plan_;
+  duplicate.link_files.push_back(plan_.live_log_file);
+  invalid.push_back(duplicate);
+  CheckpointPlan wrong_type = plan_;
+  wrong_type.live_log_file = "000001.ldb";
+  invalid.push_back(wrong_type);
+  wrong_type = plan_;
+  wrong_type.manifest_file = "MANIFEST-000004\nother";
+  invalid.push_back(wrong_type);
+  for (size_t i = 0; i < invalid.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_TRUE(ExecuteCheckpoint(env_, invalid[i], parent_, checkpoint_)
+                    .IsInvalidArgument());
+    ExpectNoCheckpoint();
+  }
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, ExistingPathsArePreserved) {
+  for (const std::string& existing : {staging_, checkpoint_}) {
+    SCOPED_TRACE(existing);
+    ASSERT_LEVELDB_OK(env_->CreateDir(existing));
+    ASSERT_LEVELDB_OK(WriteStringToFile(env_, "keep", existing + "/marker"));
+    EXPECT_TRUE(ExecuteCheckpoint(env_, plan_, parent_, checkpoint_)
+                    .IsInvalidArgument());
+    ExpectContents(existing + "/marker", "keep");
+    ASSERT_LEVELDB_OK(env_->RemoveFile(existing + "/marker"));
+    ASSERT_LEVELDB_OK(env_->RemoveDir(existing));
+    ExpectNoCheckpoint();
+  }
+  ASSERT_EQ(0, ::symlink("missing", checkpoint_.c_str()));
+  EXPECT_TRUE(
+      ExecuteCheckpoint(env_, plan_, parent_, checkpoint_).IsInvalidArgument());
+  struct stat link_stat;
+  ASSERT_EQ(0, ::lstat(checkpoint_.c_str(), &link_stat));
+  EXPECT_TRUE(S_ISLNK(link_stat.st_mode));
+  ASSERT_LEVELDB_OK(env_->RemoveFile(checkpoint_));
+  ExpectNoCheckpoint();
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, MissingAndShortPrefixesCleanStaging) {
+  for (int failure = 0; failure < 3; ++failure) {
+    SCOPED_TRACE(failure);
+    CheckpointPlan plan = plan_;
+    if (failure == 0) plan.live_log_file = "000099.log";
+    if (failure == 1) plan.live_log_size = 1000;
+    if (failure == 2) plan.manifest_size = 1000;
+    const Status status = ExecuteCheckpoint(env_, plan, parent_, checkpoint_);
+    if (failure == 0) {
+      EXPECT_TRUE(status.IsNotFound()) << status.ToString();
+    } else {
+      EXPECT_TRUE(status.IsIOError()) << status.ToString();
+      EXPECT_NE(std::string::npos, status.ToString().find("unexpected EOF"));
+    }
+    ExpectNoCheckpoint();
+  }
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, FailuresBeforeRenameCleanStaging) {
+  for (ExecuteCheckpointEnv::Failure failure :
+       {ExecuteCheckpointEnv::kLinkError,
+        ExecuteCheckpointEnv::kLinkedSyncError,
+        ExecuteCheckpointEnv::kLinkedCloseError,
+        ExecuteCheckpointEnv::kCurrentAppendError,
+        ExecuteCheckpointEnv::kCurrentSyncError,
+        ExecuteCheckpointEnv::kCurrentCloseError,
+        ExecuteCheckpointEnv::kStageSyncError,
+        ExecuteCheckpointEnv::kRenameError}) {
+    SCOPED_TRACE(failure);
+    ExecuteCheckpointEnv checked(env_, parent_, staging_, failure);
+    const Status status =
+        ExecuteCheckpoint(&checked, plan_, parent_, checkpoint_);
+    EXPECT_TRUE(status.IsIOError()) << status.ToString();
+    if (failure == ExecuteCheckpointEnv::kLinkError) {
+      EXPECT_EQ(1, checked.link_calls);
+      EXPECT_NE(std::string::npos, status.ToString().find("link failure"));
+    }
+    if (failure == ExecuteCheckpointEnv::kLinkedSyncError ||
+        failure == ExecuteCheckpointEnv::kLinkedCloseError) {
+      EXPECT_EQ(1, checked.linked_syncs);
+      EXPECT_EQ(1, checked.linked_closes);
+    }
+    if (failure == ExecuteCheckpointEnv::kCurrentAppendError ||
+        failure == ExecuteCheckpointEnv::kCurrentSyncError ||
+        failure == ExecuteCheckpointEnv::kCurrentCloseError) {
+      EXPECT_EQ(1, checked.current_closes);
+      EXPECT_NE(std::string::npos, status.ToString().find("CURRENT"));
+    }
+    ExpectNoCheckpoint();
+  }
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, UnsupportedDirectorySyncCreatesNothing) {
+  ExecuteCheckpointEnv checked(env_, parent_, staging_,
+                               ExecuteCheckpointEnv::kDirectorySyncUnsupported);
+  EXPECT_TRUE(ExecuteCheckpoint(&checked, plan_, parent_, checkpoint_)
+                  .IsNotSupportedError());
+  EXPECT_EQ(0, checked.create_dir_calls);
+  EXPECT_EQ(0, checked.link_calls);
+  ExpectNoCheckpoint();
+}
+
+TEST_F(EnvPosixExecuteCheckpointTest, ParentSyncFailureKeepsPublishedFiles) {
+  ExecuteCheckpointEnv checked(env_, parent_, staging_,
+                               ExecuteCheckpointEnv::kParentSyncError);
+  EXPECT_TRUE(
+      ExecuteCheckpoint(&checked, plan_, parent_, checkpoint_).IsIOError());
+  ExpectCompleteCheckpoint(true);
 }
 
 TEST_F(EnvPosixTest, TestOpenOnRead) {
