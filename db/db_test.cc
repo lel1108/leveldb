@@ -2075,6 +2075,8 @@ TEST_F(DBTest, CheckpointExcludesWriteInProgress) {
   ASSERT_LEVELDB_OK(DestroyDB(ckpt, copy_options));
 }
 
+#if defined(LEVELDB_PLATFORM_POSIX)
+
 TEST_F(DBTest, CreateCheckpointSurvivesSourceCompactionAndDeletion) {
   Options options = CurrentOptions();
   options.env = env_;
@@ -2330,6 +2332,31 @@ TEST_F(DBTest, CreateCheckpointWhileWritingAndCompacting) {
   copy.reset();
   ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
 }
+
+#else
+
+TEST_F(DBTest, CreateCheckpointUnsupportedDirectorySyncReleasesHold) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("source", "source value"));
+  const std::string checkpoint_dir = dbname_ + "_api_unsupported";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+
+  // Unsupported directory sync must not leave a destination or deletion hold.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    Status s = db_->CreateCheckpoint(checkpoint_dir);
+    ASSERT_TRUE(s.IsNotSupportedError()) << s.ToString();
+    ASSERT_FALSE(env_->FileExists(checkpoint_dir));
+    ASSERT_FALSE(env_->FileExists(checkpoint_dir + ".tmp"));
+    ASSERT_EQ("source value", Get("source"));
+    CheckpointPlan plan;
+    ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
+    dbfull()->FinishCheckpoint();
+  }
+}
+
+#endif  // defined(LEVELDB_PLATFORM_POSIX)
 
 TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ(config::kMaxMemCompactLevel, 2)
