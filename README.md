@@ -25,6 +25,8 @@ Authors: Sanjay Ghemawat (sanjay@google.com) and Jeff Dean (jeff@google.com)
 
   [LevelDB library documentation](https://github.com/google/leveldb/blob/main/doc/index.md) is online and bundled with the source code.
 
+  [Online checkpoint implementation and tests (course project)](doc/checkpoint.md).
+
 # Limitations
 
   * This is not a SQL database.  It does not have a relational data model, it does not support SQL queries, and it has no support for indexes.

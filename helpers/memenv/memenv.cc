@@ -330,6 +330,12 @@ class InMemoryEnv : public EnvWrapper {
 
   Status CreateDir(const std::string& dirname) override { return Status::OK(); }
 
+  Status SyncDir(const std::string& dirname) override {
+    // Directory durability is not modeled here. Never forward memory paths to
+    // the base filesystem or claim that they have been persisted.
+    return Status::NotSupported("SyncDir", dirname);
+  }
+
   Status RemoveDir(const std::string& dirname) override { return Status::OK(); }
 
   Status GetFileSize(const std::string& fname, uint64_t* file_size) override {
@@ -353,6 +359,11 @@ class InMemoryEnv : public EnvWrapper {
     file_map_[target] = file_map_[src];
     file_map_.erase(src);
     return Status::OK();
+  }
+
+  Status LinkFile(const std::string& src, const std::string& target) override {
+    // File paths belong to this in-memory filesystem, not to the base Env.
+    return Status::NotSupported("LinkFile", src + " -> " + target);
   }
 
   Status LockFile(const std::string& fname, FileLock** lock) override {

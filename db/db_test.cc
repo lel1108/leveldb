@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -2073,6 +2074,290 @@ TEST_F(DBTest, CheckpointExcludesWriteInProgress) {
   delete copy;
   ASSERT_LEVELDB_OK(DestroyDB(ckpt, copy_options));
 }
+
+#if defined(LEVELDB_PLATFORM_POSIX)
+
+TEST_F(DBTest, CreateCheckpointSurvivesSourceCompactionAndDeletion) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("a", "a1"));
+  ASSERT_LEVELDB_OK(Put("b", "b1"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  ASSERT_LEVELDB_OK(Put("b", "b2"));
+  ASSERT_LEVELDB_OK(Put("c", "c2"));
+
+  const std::string checkpoint_dir = dbname_ + "_api_independent";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+  ASSERT_LEVELDB_OK(db_->CreateCheckpoint(checkpoint_dir));
+  ASSERT_FALSE(env_->FileExists(checkpoint_dir + ".tmp"));
+
+  ASSERT_LEVELDB_OK(Put("a", "a3"));
+  ASSERT_LEVELDB_OK(Delete("c"));
+  ASSERT_LEVELDB_OK(Put("after", "new"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  db_->CompactRange(nullptr, nullptr);
+  Close();
+  ASSERT_LEVELDB_OK(DestroyDB(dbname_, options));
+
+  options.paranoid_checks = true;
+  options.reuse_logs = true;
+  DB* raw_copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  std::unique_ptr<DB> copy(raw_copy);
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("a1", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("b2", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "c", &value));
+  ASSERT_EQ("c2", value);
+  ASSERT_TRUE(copy->Get(ReadOptions(), "after", &value).IsNotFound());
+  copy.reset();
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+}
+
+TEST_F(DBTest, CreateCheckpointEmptyDatabase) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  const std::string checkpoint_dir = dbname_ + "_api_empty";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+  ASSERT_LEVELDB_OK(db_->CreateCheckpoint(checkpoint_dir));
+
+  DB* raw_copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  std::unique_ptr<DB> copy(raw_copy);
+  std::unique_ptr<Iterator> iter(copy->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_LEVELDB_OK(iter->status());
+  iter.reset();
+  ASSERT_LEVELDB_OK(copy->Put(WriteOptions(), "new", "value"));
+  copy.reset();
+
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  copy.reset(raw_copy);
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "new", &value));
+  ASSERT_EQ("value", value);
+  ASSERT_EQ("NOT_FOUND", Get("new"));
+  copy.reset();
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+}
+
+TEST_F(DBTest, CreateCheckpointPreservesExistingDestination) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("source", "source value"));
+  const std::string checkpoint_dir = dbname_ + "_api_existing";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+  Options create_options = options;
+  create_options.create_if_missing = true;
+  DB* raw_copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(create_options, checkpoint_dir, &raw_copy));
+  std::unique_ptr<DB> copy(raw_copy);
+  ASSERT_LEVELDB_OK(copy->Put(WriteOptions(), "existing", "keep"));
+  copy.reset();
+
+  ASSERT_FALSE(db_->CreateCheckpoint(checkpoint_dir).ok());
+  ASSERT_FALSE(env_->FileExists(checkpoint_dir + ".tmp"));
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  copy.reset(raw_copy);
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "existing", &value));
+  ASSERT_EQ("keep", value);
+  ASSERT_TRUE(copy->Get(ReadOptions(), "source", &value).IsNotFound());
+  copy.reset();
+
+  // A second call must work after the failed call releases its deletion hold.
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+  ASSERT_LEVELDB_OK(db_->CreateCheckpoint(checkpoint_dir));
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  copy.reset(raw_copy);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "source", &value));
+  ASSERT_EQ("source value", value);
+  copy.reset();
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+}
+
+TEST_F(DBTest, CreateCheckpointCleansUpOnDataSyncError) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("a", "a1"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  ASSERT_LEVELDB_OK(Put("b", "b2"));
+  const std::string checkpoint_dir = dbname_ + "_api_sync_error";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+
+  env_->data_sync_error_.store(true);
+  Status s = db_->CreateCheckpoint(checkpoint_dir);
+  env_->data_sync_error_.store(false);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_FALSE(env_->FileExists(checkpoint_dir));
+  ASSERT_FALSE(env_->FileExists(checkpoint_dir + ".tmp"));
+  ASSERT_EQ("b2", Get("b"));
+
+  ASSERT_LEVELDB_OK(db_->CreateCheckpoint(checkpoint_dir));
+  DB* raw_copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  std::unique_ptr<DB> copy(raw_copy);
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("a1", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("b2", value);
+  copy.reset();
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+}
+
+TEST_F(DBTest, CreateCheckpointCleansUpOnManifestCopyError) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("a", "a1"));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+  ASSERT_LEVELDB_OK(Put("b", "b2"));
+  const std::string checkpoint_dir = dbname_ + "_api_copy_error";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+
+  env_->manifest_write_error_.store(true);
+  Status s = db_->CreateCheckpoint(checkpoint_dir);
+  env_->manifest_write_error_.store(false);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_FALSE(env_->FileExists(checkpoint_dir));
+  ASSERT_FALSE(env_->FileExists(checkpoint_dir + ".tmp"));
+  ASSERT_EQ("b2", Get("b"));
+
+  ASSERT_LEVELDB_OK(db_->CreateCheckpoint(checkpoint_dir));
+  DB* raw_copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  std::unique_ptr<DB> copy(raw_copy);
+  std::string value;
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "a", &value));
+  ASSERT_EQ("a1", value);
+  ASSERT_LEVELDB_OK(copy->Get(ReadOptions(), "b", &value));
+  ASSERT_EQ("b2", value);
+  copy.reset();
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+}
+
+TEST_F(DBTest, CreateCheckpointWhileWritingAndCompacting) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  options.write_buffer_size = 64 << 10;
+  Reopen(&options);
+  const std::string checkpoint_dir = dbname_ + "_api_concurrent";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+  std::atomic<bool> stop(false);
+  std::atomic<bool> failed(false);
+  std::atomic<int> done(0);
+  std::atomic<int> compactions(0);
+  std::thread writer([&]() {
+    for (int i = 0; !stop.load(); ++i) {
+      const std::string value = std::string(256, 'x') + std::to_string(i);
+      WriteBatch batch;
+      batch.Put(Key(i) + "a", value);
+      batch.Put(Key(i) + "b", value);
+      Status s = db_->Write(WriteOptions(), &batch);
+      if (!s.ok()) {
+        failed.store(true);
+        break;
+      }
+      done.store(i + 1);
+      if ((i + 1) % 100 == 0) {
+        if (!dbfull()->TEST_CompactMemTable().ok()) {
+          failed.store(true);
+          break;
+        }
+      }
+      if ((i + 1) % 200 == 0) {
+        db_->CompactRange(nullptr, nullptr);
+        compactions.fetch_add(1);
+      }
+    }
+  });
+  struct StopWriter {
+    std::atomic<bool>* stop;
+    std::thread* writer;
+    ~StopWriter() {
+      stop->store(true);
+      if (writer->joinable()) writer->join();
+    }
+  } stop_writer{&stop, &writer};
+
+  const uint64_t deadline = env_->NowMicros() + 10000000;
+  while (compactions.load() < 2 && !failed.load() &&
+         env_->NowMicros() < deadline) {
+    env_->SleepForMicroseconds(1000);
+  }
+  const bool ready = compactions.load() >= 2;
+  const int before = done.load();
+  Status s = ready ? db_->CreateCheckpoint(checkpoint_dir)
+                   : Status::IOError("writer did not reach checkpoint setup");
+  const int after = done.load();
+  stop.store(true);
+  writer.join();
+  ASSERT_TRUE(ready);
+  ASSERT_FALSE(failed.load());
+  ASSERT_LEVELDB_OK(s);
+
+  options.paranoid_checks = true;
+  DB* raw_copy = nullptr;
+  ASSERT_LEVELDB_OK(DB::Open(options, checkpoint_dir, &raw_copy));
+  std::unique_ptr<DB> copy(raw_copy);
+  bool reached_end = false;
+  int copied_batches = 0;
+  for (int i = 0; i < done.load(); ++i) {
+    std::string a, b;
+    Status sa = copy->Get(ReadOptions(), Key(i) + "a", &a);
+    Status sb = copy->Get(ReadOptions(), Key(i) + "b", &b);
+    ASSERT_EQ(sa.ok(), sb.ok()) << "partial batch " << i;
+    if (sa.ok()) {
+      ASSERT_FALSE(reached_end) << "gap before batch " << i;
+      ASSERT_EQ(std::string(256, 'x') + std::to_string(i), a);
+      ASSERT_EQ(a, b);
+      ++copied_batches;
+    } else {
+      ASSERT_TRUE(sa.IsNotFound()) << sa.ToString();
+      ASSERT_TRUE(sb.IsNotFound()) << sb.ToString();
+      reached_end = true;
+    }
+  }
+  ASSERT_GE(copied_batches, before);
+  // The writer may publish its completed-batch counter just after the call.
+  ASSERT_LE(copied_batches, after + 1);
+  copy.reset();
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+}
+
+#else
+
+TEST_F(DBTest, CreateCheckpointUnsupportedDirectorySyncReleasesHold) {
+  Options options = CurrentOptions();
+  options.env = env_;
+  Reopen(&options);
+  ASSERT_LEVELDB_OK(Put("source", "source value"));
+  const std::string checkpoint_dir = dbname_ + "_api_unsupported";
+  ASSERT_LEVELDB_OK(DestroyDB(checkpoint_dir, options));
+
+  // Unsupported directory sync must not leave a destination or deletion hold.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    Status s = db_->CreateCheckpoint(checkpoint_dir);
+    ASSERT_TRUE(s.IsNotSupportedError()) << s.ToString();
+    ASSERT_FALSE(env_->FileExists(checkpoint_dir));
+    ASSERT_FALSE(env_->FileExists(checkpoint_dir + ".tmp"));
+    ASSERT_EQ("source value", Get("source"));
+    CheckpointPlan plan;
+    ASSERT_LEVELDB_OK(dbfull()->PrepareCheckpoint(&plan));
+    dbfull()->FinishCheckpoint();
+  }
+}
+
+#endif  // defined(LEVELDB_PLATFORM_POSIX)
+
 TEST_F(DBTest, ManualCompaction) {
   ASSERT_EQ(config::kMaxMemCompactLevel, 2)
       << "Need to update this test to match kMaxMemCompactLevel";
